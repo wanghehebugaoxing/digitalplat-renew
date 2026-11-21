@@ -1,0 +1,139 @@
+/**
+ * DNSHE 域名自动续期 —— GitHub Actions
+ *
+ * DNSHE 免费子域在到期前 180 天才可续期（提前调返回 422）。
+ * API: https://api005.dnshe.com/index.php?m=domain_hub
+ * 认证: X-API-Key + X-API-Secret
+ */
+name: DNSHE Domain Auto-Renew
+
+on:
+  schedule:
+    - cron: '30 1 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (only check, no renew)'
+        type: boolean
+        default: true
+
+permissions:
+  issues: write
+  contents: write
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and renew DNSHE domains
+        env:
+          DNSHE_API_KEY: ${{ secrets.DNSHE_API_KEY }}
+          DNSHE_API_SECRET: ${{ secrets.DNSHE_API_SECRET }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          API='https://api005.dnshe.com/index.php?m=domain_hub'
+          if [ -z "${DNSHE_API_KEY:-}" ] || [ -z "${DNSHE_API_SECRET:-}" ]; then
+            echo "::error::Missing secrets DNSHE_API_KEY / DNSHE_API_SECRET"
+            exit 1
+          fi
+
+          H_KEY="X-API-Key: $DNSHE_API_KEY"
+          H_SEC="X-API-Secret: $DNSHE_API_SECRET"
+
+          TMP=$(mktemp)
+          curl -sf -H "$H_KEY" -H "$H_SEC" -H 'Accept: application/json' \
+            "$API&endpoint=subdomains&action=list&per_page=200&sort_by=expires_at&sort_dir=asc" -o "$TMP" || {
+            echo "::error::Failed to list domains"
+            cat "$TMP" || true
+            exit 1
+          }
+
+          echo '--- domains ---'
+          jq -r '.subdomains[] | "\(.full_domain)\t\(.id)\t\(.expires_at)\t\(.never_expires)"' "$TMP"
+
+          FAIL=0
+          REPORT=''
+          RENEWED=0
+          NOTYET=0
+
+          while IFS=$'\t' read -r NAME ID EXPIRY NEVER; do
+            [ -z "$NAME" ] && continue
+
+            if [ "$NEVER" = "1" ]; then
+              REPORT="$REPORT\n- $NAME: 永久有效，跳过"
+              continue
+            fi
+
+            # expires_at 形如 2027-10-31 14:02:15（+08:00）
+            ISO="${EXPIRY// /T}+08:00"
+            E=$(date -d "$ISO" +%s); N=$(date +%s)
+            D=$(( (E-N)/86400 ))
+            echo "$NAME -> $EXPIRY, $D days left"
+
+            if [ "$D" -gt 180 ]; then
+              REPORT="$REPORT\n- $NAME: ${D} 天（未进 180 天窗口，还差 $((D-180)) 天）"
+              continue
+            fi
+
+            if [ "$DRY_RUN" = 'true' ]; then
+              REPORT="$REPORT\n- $NAME: 在窗口内（${D} 天）[dry-run]"
+              continue
+            fi
+
+            R=$(curl -s -X POST -H "$H_KEY" -H "$H_SEC" \
+              -H 'Content-Type: application/json' -H 'Accept: application/json' \
+              -d "{\"subdomain_id\": $ID}" \
+              "$API&endpoint=subdomains&action=renew")
+            echo "renew $NAME => $R"
+
+            OK=$(echo "$R" | jq -r '.success // false')
+            CODE=$(echo "$R" | jq -r '.error_code // ""')
+
+            if [ "$OK" = 'true' ]; then
+              NEWEXP=$(echo "$R" | jq -r '.new_expires_at // .expires_at // "unknown"')
+              REPORT="$REPORT\n- $NAME: 续期成功 -> $NEWEXP"
+              RENEWED=$((RENEWED+1))
+            elif [ "$CODE" = 'renewal_not_yet_available' ]; then
+              D2=$(echo "$R" | jq -r '.details.days_until_window // "?"')
+              REPORT="$REPORT\n- $NAME: 未到窗口（还差 ${D2} 天）"
+              NOTYET=$((NOTYET+1))
+            else
+              MSG=$(echo "$R" | jq -r '.message // .error // "unknown"')
+              REPORT="$REPORT\n- $NAME: 失败（$MSG）"
+              FAIL=1
+            fi
+          done < <(jq -r '.subdomains[] | "\(.full_domain)\t\(.id)\t\(.expires_at)\t\(.never_expires)"' "$TMP")
+
+          echo -e "== Summary ==\n$REPORT"
+
+          if [ "$FAIL" = '1' ]; then
+            gh issue create \
+              --title '[domain] DNSHE renew needs manual check' \
+              --body "$(printf "$REPORT")" || true
+            exit 1
+          fi
+
+          if [ "$RENEWED" -gt 0 ]; then
+            gh issue create \
+              --title "[domain] DNSHE renewed $RENEWED domain(s) on $(date -u +%F)" \
+              --body "$(printf "$REPORT")" || true
+          fi
+
+          rm -f "$TMP"
+
+      - name: Checkout for heartbeat
+        uses: actions/checkout@v4
+
+      - name: Keepalive heartbeat
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name 'renew-bot'
+          git config user.email 'renew-bot@users.noreply.github.com'
+          echo "dnshe: $(date -u +%FT%TZ)" > heartbeat-dnshe.txt
+          git add heartbeat-dnshe.txt
+          git diff --cached --quiet && exit 0
+          git commit -m 'chore: dnshe heartbeat'
+          git push || echo '::warning::push failed'
