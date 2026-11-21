@@ -1,10 +1,8 @@
-/**
- * DNSHE 域名自动续期 —— GitHub Actions
- *
- * DNSHE 免费子域在到期前 180 天才可续期（提前调返回 422）。
- * API: https://api005.dnshe.com/index.php?m=domain_hub
- * 认证: X-API-Key + X-API-Secret
- */
+# DNSHE 域名自动续期 —— GitHub Actions
+#
+# DNSHE 免费子域在到期前 180 天才可续期（提前调返回 422）。
+# API: https://api005.dnshe.com/index.php?m=domain_hub
+# 认证: X-API-Key + X-API-Secret
 name: DNSHE Domain Auto-Renew
 
 on:
